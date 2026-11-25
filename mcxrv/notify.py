@@ -65,8 +65,14 @@ def format_message(event: dict, meta: dict) -> str:
         if risk.get("lots_a") is not None and risk.get("lots_b") is not None:
             la, lb = int(risk["lots_a"]), int(risk["lots_b"])
             lots = " ({} x {}, {} x {})".format(la, a, lb, b)
+        cost = p.get("cost") or {}
+        cost_line = ""
+        if cost.get("round_trip_bp") is not None:
+            cost_line = "Round trip costs ~{:.0f} bp: {} the gap\n".format(
+                cost["round_trip_bp"], "less than" if cost.get("covers_cost") else "MORE than")
         return ("GOLD SPREAD ALERT{tag} - {asof}\n"
                 "{pair}: extra gap {d} bp, z {z}\n"
+                + cost_line +
                 "Buy {buy} / sell {sell}{lots}\n"
                 "Margin {m}, buffer {buf}\n"
                 "Checks: history, stationarity, half-life, size, risk - all passed\n"
@@ -148,7 +154,7 @@ def digest(prev: dict | None, new: dict, max_lines: int = 8) -> str | None:
             old.get("data_fingerprint") == meta.get("data_fingerprint"):
         return None
 
-    refused = [p for p in new.get("pairs", []) if p.get("status") == "NO_TRADE"]
+    refused = [p for p in new.get("pairs", []) if p.get("status") in ("NO_TRADE", "WATCH")]
     an = new.get("anomalies") or {}
     flags = [a for a in (an.get("latest") or []) if str(a.get("date")) == str(meta.get("asof"))]
     if not refused and not flags:

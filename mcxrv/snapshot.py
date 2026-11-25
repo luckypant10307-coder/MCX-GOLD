@@ -101,13 +101,23 @@ def failed_gates(row) -> list[str]:
     return [GATE_LABELS[g] for g in GATE_LABELS if g in row and not bool(row[g])]
 
 
-def decide(pair_row, board_row, z_entry: float) -> dict:
-    """One pair, one session -> {status, reason}. Pure; tested directly."""
+def decide(pair_row, board_row, z_entry: float, edge: dict | None = None,
+           cost_gate: bool = False) -> dict:
+    """
+    One pair, one session -> {status, reason}. Pure; tested directly.
+
+    With `cost_gate`, a pair that clears every other gate but whose expected profit
+    does not beat its cost (edge_gate.edge_check, the backtest's own rule) is WATCH:
+    worth looking at, not worth trading.
+    """
     z = pair_row.get("z")
     unusual = z is not None and np.isfinite(z) and abs(z) >= z_entry
     if bool(pair_row.get("signal_ok")):
         action = board_row.get("action") if board_row is not None else None
         if action in ADDABLE:
+            if cost_gate and edge is not None and not edge.get("ok"):
+                return {"status": "WATCH", "reason": edge.get("reason") or "below the cost hurdle",
+                        "binding_gate": "cost"}
             return {"status": "ALERT", "reason": "all gates passed; " + str(action),
                     "binding_gate": None}
         reason = (board_row or {}).get("reason") or "risk board unavailable"
@@ -120,7 +130,14 @@ def decide(pair_row, board_row, z_entry: float) -> dict:
             "binding_gate": None}
 
 
-def _verdict(perf: dict, warming_up: str | None = None) -> dict:
+def _verdict(perf: dict, warming_up: str | None = None, net_bp=None) -> dict:
+    """
+    The headline. A positive average is called an edge only when its rough 95% range
+    (mean +/- 2 standard errors over trades) stays above zero; a small positive
+    average with a range across zero is break-even, and saying otherwise would sell
+    noise as a result. Trades overlap, so the true range is wider still: this test
+    can only err towards caution.
+    """
     n = int(perf.get("n_trades") or 0)
     if n == 0 and warming_up:
         return {"headline": "Not enough history to backtest yet ({}).".format(warming_up),
@@ -130,11 +147,21 @@ def _verdict(perf: dict, warming_up: str | None = None) -> dict:
                 "edge_survives_costs": False}
     net = perf.get("mean_net_bp")
     gross = perf.get("mean_gross_bp")
-    ok = net is not None and np.isfinite(net) and net > 0
-    head = ("Net edge positive after costs ({:+.1f} bp per trade)".format(net) if ok else
-            "No edge survives costs: {:+.1f} bp gross becomes {:+.1f} bp net per trade"
-            .format(gross or 0.0, net or 0.0))
-    return {"headline": head, "edge_survives_costs": bool(ok)}
+    if net is None or not np.isfinite(net) or net <= 0:
+        return {"headline": "No edge survives costs: {:+.1f} bp gross becomes {:+.1f} bp net per trade"
+                .format(gross or 0.0, net or 0.0), "edge_survives_costs": False}
+    x = np.asarray([v for v in (net_bp if net_bp is not None else []) if np.isfinite(v)], dtype=float)
+    if len(x) >= 2:
+        se = float(x.std(ddof=1) / np.sqrt(len(x)))
+        lo, hi = net - 2 * se, net + 2 * se
+        if lo <= 0:
+            return {"headline": "About break-even after costs: {:+.1f} bp net per trade, but the likely range "
+                                "({:+.1f} to {:+.1f} bp) includes zero, so not a reliable edge".format(net, lo, hi),
+                    "edge_survives_costs": False, "range_bp": [lo, hi]}
+        return {"headline": "Net edge positive after costs: {:+.1f} bp per trade (likely range {:+.1f} to {:+.1f} bp)"
+                .format(net, lo, hi), "edge_survives_costs": True, "range_bp": [lo, hi]}
+    return {"headline": "Net {:+.1f} bp per trade, from too few trades to call".format(net),
+            "edge_survives_costs": False}
 
 
 # ---------------------------------------------------------------- monitoring detail
@@ -179,6 +206,74 @@ def suggested_trade(p: dict, legs: dict) -> dict | None:
     return {"legs": [leg(sell, "SELL"), leg(buy, "BUY")],
             "residual_frac": risk.get("residual_frac"),
             "margin": risk.get("marginal_margin")}
+
+
+def live_edge(pair_row: dict, board_row: dict | None, liq: dict, gate_cfg, cost_cfg,
+              illiquid_exit_mult: float = 3.0) -> dict | None:
+    """
+    The cost hurdle for the trade the risk board would put on today, priced the way
+    the backtest prices an entry: these contracts, these lots, entry cost on both
+    legs plus an exit estimate widened on a leg that is already untradable.
+    """
+    from mcxrv.stage3_gates_decision import edge_gate
+    b = board_row or {}
+    ca, cb, la, lb = b.get("contract_a"), b.get("contract_b"), b.get("lots_a"), b.get("lots_b")
+    ra, rb = liq.get(ca) or {}, liq.get(cb) or {}
+    if not (ca and cb and la and lb) or ra.get("close") is None or rb.get("close") is None:
+        return None
+    z = pair_row.get("z")
+    if z is None or not np.isfinite(z):
+        return None
+    d = -1 if z > 0 else 1                      # +1: spread too low -> buy a, sell b
+
+    def mult(sym):
+        sp = specs.get(sym)
+        return sp.trading_unit_g / sp.quote_base_g
+    na = abs(ra["close"] * mult(pair_row["sym_a"]) * la)
+    nb = abs(rb["close"] * mult(pair_row["sym_b"]) * lb)
+    side_a, side_b = ("buy", "sell") if d > 0 else ("sell", "buy")
+    flip = {"buy": "sell", "sell": "buy"}
+
+    def leg(n, side, row, lots, closing):
+        hs = float(row.get("half_spread_bp") or 0.0)
+        if closing and not row.get("tradable", True):
+            hs *= illiquid_exit_mult
+        return costs.leg_cost_inr(n, side, hs, lots, max(row.get("max_lots") or 1, 1), cost_cfg)["total_inr"]
+    entry = leg(na, side_a, ra, la, False) + leg(nb, side_b, rb, lb, False)
+    exit_cost = leg(na, flip[side_a], ra, la, True) + leg(nb, flip[side_b], rb, lb, True)
+    return edge_gate.edge_check(z, pair_row.get("scale"), pair_row.get("halflife"),
+                                b.get("sessions_a"), b.get("sessions_b"), entry, exit_cost, na,
+                                gate_cfg)
+
+
+def trade_cost(p: dict, liq: dict, cost_cfg: costs.CostConfig | None = None) -> dict | None:
+    """
+    What the trade the risk board would put on costs, next to what the gap offers.
+
+    The contracts and lots are the board's; the cost is a full round trip (open and
+    close both legs) at today's spread estimate plus statutory charges, in bp of one
+    leg, the same units as the gap. No model: two measured numbers side by side,
+    so whoever reads an alert can see whether the gap even pays for the trade.
+    """
+    risk = p.get("risk") or {}
+    ca, cb = risk.get("contract_a"), risk.get("contract_b")
+    la, lb = risk.get("lots_a"), risk.get("lots_b")
+    ra, rb = liq.get(ca) or {}, liq.get(cb) or {}
+    if not (ca and cb and la and lb) or ra.get("close") is None or rb.get("close") is None:
+        return None
+    def mult(sym):                      # rupees of position value per unit of quote, per lot
+        sp = specs.get(sym)
+        return sp.trading_unit_g / sp.quote_base_g
+    notional = 0.5 * (abs(ra["close"] * mult(p["sym_a"]) * la)
+                      + abs(rb["close"] * mult(p["sym_b"]) * lb))
+    rt = costs.round_trip_bp(notional, ra.get("half_spread_bp") or 0.0, rb.get("half_spread_bp") or 0.0,
+                             cost_cfg or costs.CostConfig(), la, max(ra.get("max_lots") or 1, 1),
+                             lb, max(rb.get("max_lots") or 1, 1))
+    gap = abs(float(p.get("dislocation_bp") or 0.0))
+    return {"gap_bp": gap, "round_trip_bp": rt["total_bp"],
+            "spread_cost_bp": rt["execution_bp"], "charges_bp": rt["statutory_bp"],
+            "gap_after_cost_bp": gap - rt["total_bp"], "covers_cost": bool(gap > rt["total_bp"]),
+            "notional_per_leg": notional}
 
 
 def archive_log(csv_dir: str, show: int = 30) -> dict:
@@ -394,6 +489,8 @@ def research(result) -> dict:
     bd = result.bt_daily
     if bd is not None and not bd.empty and "equity" in bd.columns:
         out["equity"] = _records(bd, ["date", "equity"])
+    if (result.notes or {}).get("forward_test"):
+        out["forward_test"] = result.notes["forward_test"]
     return clean(out)
 
 
@@ -415,7 +512,9 @@ def build(result, generated_at: datetime | None = None, archive: dict | None = N
         liq = {}
         if result.rows is not None and not result.rows.empty:
             lr = result.rows[result.rows["date"] == result.rows["date"].max()]
-            liq = lr.set_index("contract_id")[["tradable", "half_spread_bp"]].to_dict("index")
+            cols = [c for c in ("tradable", "half_spread_bp", "close", "max_lots",
+                                "sessions_to_expiry") if c in lr.columns]
+            liq = lr.set_index("contract_id")[cols].to_dict("index")
         recent = set(sorted(q["date"].unique())[-LIQ_AVG_SESSIONS:])
         avg_vol = (q[q["date"].isin(recent)].groupby("contract_id")["volume"].mean()
                    .to_dict())
@@ -444,12 +543,17 @@ def build(result, generated_at: datetime | None = None, archive: dict | None = N
     brd = {}
     if board is not None and not board.empty:
         brd = {r["pair"]: r for r in board.to_dict("records")}
-    latest_pairs, counts = [], {"ALERT": 0, "NO_TRADE": 0, "QUIET": 0}
+    latest_pairs, counts = [], {"ALERT": 0, "WATCH": 0, "NO_TRADE": 0, "QUIET": 0}
+    notes = result.notes or {}
+    gate_on = bool(notes.get("cost_gate"))
     if pairs is not None and not pairs.empty:
         lp = pairs[pairs["date"] == pairs["date"].max()]
         for r in lp.to_dict("records"):
             b = brd.get(r["pair"])
-            d = decide(r, b, z_entry)
+            edge = (live_edge(r, b, liq, notes.get("edge_gate"),
+                              notes.get("cost_cfg") or costs.CostConfig())
+                    if b is not None else None)
+            d = decide(r, b, z_entry, edge=edge, cost_gate=gate_on)
             counts[d["status"]] += 1
             latest_pairs.append(clean({
                 "pair": r["pair"], "sym_a": r["sym_a"], "sym_b": r["sym_b"],
@@ -461,6 +565,8 @@ def build(result, generated_at: datetime | None = None, archive: dict | None = N
                 "gates": {g: bool(r.get(g)) for g in GATE_LABELS},
                 "signal_ok": r.get("signal_ok"), "direction": r.get("direction"),
                 **d,
+                "edge": None if edge is None else {k: edge[k] for k in (
+                    "exp_gross_bp", "cost_bp", "exp_net_bp", "ok", "reason")},
                 "risk": None if b is None else {
                     k: b.get(k) for k in (
                         "action", "reason", "contract_a", "contract_b", "sessions_a",
@@ -498,7 +604,7 @@ def build(result, generated_at: datetime | None = None, archive: dict | None = N
                         n_sessions, need),
                     "binding_gate": "history", "risk": None,
                 }))
-    order = {"ALERT": 0, "NO_TRADE": 1, "QUIET": 2, "WARMUP": 3}
+    order = {"ALERT": 0, "WATCH": 1, "NO_TRADE": 2, "QUIET": 3, "WARMUP": 4}
     latest_pairs.sort(key=lambda p: (order[p["status"]], -abs(p["z"] or 0)))
 
     # What a reader needs beside the numbers: which contracts, how far apart their
@@ -535,7 +641,8 @@ def build(result, generated_at: datetime | None = None, archive: dict | None = N
         except (TypeError, KeyError, ValueError):
             p["expiry_gap_days"] = None
         p["trade"] = (clean(suggested_trade(p, pair_legs))
-                      if p["status"] in ("ALERT", "NO_TRADE") else None)
+                      if p["status"] in ("ALERT", "WATCH", "NO_TRADE") else None)
+        p["cost"] = clean(trade_cost(p, liq))
         p["telegram"] = (_notify.format_message({"kind": "new_alert", "pair_state": p}, meta_for_msg)
                          if p["status"] == "ALERT" else None)
 
@@ -638,7 +745,10 @@ def build(result, generated_at: datetime | None = None, archive: dict | None = N
                          result.performance,
                          warming_up=latest_pairs[0]["reason"].split(": ", 1)[1]
                          if latest_pairs and counts["WARMUP"] == len(latest_pairs)
-                         else None)},
+                         else None,
+                         net_bp=(result.trades["net_bp"].to_numpy()
+                                 if result.trades is not None and len(result.trades)
+                                 and "net_bp" in result.trades.columns else None))},
         "research": research(result),
         "archive": archive,
         "parameters": engine_parameters(result),

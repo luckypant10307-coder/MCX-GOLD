@@ -10,9 +10,10 @@ system loads the exchange's settlement prices, puts all four on the same footing
 (rupees per 10 g of fine gold, normal expiry gap removed), and scores how unusual the
 gap is for each of the six pairs. A pair that is unusual and passes every risk gate is
 an ALERT. A walk-forward backtest over 1,236 sessions (Jan 2022 – Oct 2026) answers
-whether trading those gaps would have paid: **+17.5 bp per trade before costs, −5.3 bp
-after**. The gaps are real but smaller than the cost of trading them, and the system
-says so. It reads only public data and never places an order.
+whether trading those gaps would have paid: **+17.6 bp per trade before costs and
++2.9 bp after** with discount-broker charges (−5.3 bp with full-service brokerage),
+with a likely range of −14.6 to +20.4 bp. The gaps are real, but after costs trading
+them only about breaks even, and the system says so. It reads only public data and never places an order.
 
 **Contents**
 
@@ -177,6 +178,11 @@ mispricing; for each pair it is turned into a z-score against that pair's own hi
 pair must also have enough sessions before expiry, enough liquidity, room after costs,
 affordable margin, a risk board that accepts the added exposure, and an account not
 halted by the drawdown kill switch. Every decision carries its reason.
+Each pair also carries the round-trip cost of the trade the board would put on (spread
+estimate plus brokerage and exchange charges), shown next to its gap. A cost-aware
+entry gate and a learned gain model were tested and did not improve results on unseen
+years; see [EXPERIMENTS.md](EXPERIMENTS.md). A stricter rule (|z| ≥ 3) runs alongside as
+a forward test fixed on 4 Nov 2026, counting only trades entered from 5 Nov 2026.
 
 **Stage 4 — Simulate.** The backtest walks forward one session at a time, using only
 information available that day. It fills every trade at the **next** session's price
